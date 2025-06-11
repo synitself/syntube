@@ -126,8 +126,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if user_id not in user_process_locks:
         user_process_locks[user_id] = asyncio.Lock()
     if user_process_locks[user_id].locked():
-        await update.message.reply_text("⏳ Пожалуйста, подождите, предыдущая задача еще выполняется.", quote=True)
-        return
+        await update.message.reply_text(
+            "⏳ Пожалуйста, подождите, предыдущая задача еще выполняется.",
+            reply_to_message_id=update.message.message_id
+        )
 
     # Очищаем предыдущее состояние меню, если оно было
     state = get_user_state(user_id)
