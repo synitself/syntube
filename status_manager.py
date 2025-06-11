@@ -1,17 +1,11 @@
 import logging
-
 import telegram.error
 from telegram import Bot
-
 import db
 
 logger = logging.getLogger(__name__)
 
 async def update_status_message(user_id: int, bot: Bot, text: str, pin: bool = True):
-    """
-    Обновляет существующее статусное сообщение или создает новое.
-    Также закрепляет его, если нужно.
-    """
     settings = db.get_user_settings(user_id)
     if not settings:
         logger.error(f"Не удалось обновить статус для user {user_id}: пользователь не найден в БД.")
@@ -20,14 +14,13 @@ async def update_status_message(user_id: int, bot: Bot, text: str, pin: bool = T
     message_id = settings.get('status_message_id')
     edit_successful = False
 
-    # Пытаемся отредактировать существующее сообщение
     if message_id:
         try:
             await bot.edit_message_text(chat_id=user_id, message_id=message_id, text=text)
             edit_successful = True
         except telegram.error.BadRequest as e:
             if "message is not modified" in str(e).lower():
-                edit_successful = True # Сообщение уже в нужном состоянии
+                edit_successful = True
             elif "message to edit not found" in str(e).lower():
                 logger.warning(f"Статусное сообщение {message_id} для user {user_id} не найдено, будет создано новое.")
             else:
@@ -35,7 +28,6 @@ async def update_status_message(user_id: int, bot: Bot, text: str, pin: bool = T
         except telegram.error.TelegramError as e:
             logger.error(f"Ошибка Telegram при редактировании статуса для user {user_id}: {e}")
 
-    # Если редактирование не удалось или ID не было, отправляем новое
     if not edit_successful:
         try:
             sent_message = await bot.send_message(chat_id=user_id, text=text)
@@ -44,9 +36,8 @@ async def update_status_message(user_id: int, bot: Bot, text: str, pin: bool = T
             logger.info(f"Создано новое статусное сообщение {message_id} для user {user_id}.")
         except telegram.error.TelegramError as e:
             logger.error(f"Не удалось отправить новое статусное сообщение для user {user_id}: {e}")
-            return # Выходим, если даже отправить не удалось
+            return
 
-    # Закрепляем сообщение, если нужно
     if message_id and pin:
         try:
             await bot.pin_chat_message(chat_id=user_id, message_id=message_id, disable_notification=True)

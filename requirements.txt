@@ -1,7 +1,7 @@
 python-telegram-bot[job-queue]
-python-telegram-bot
 yt-dlp
-pydub
+Pillow
 mutagen
-requests
 python-dotenv
+requests
+python-telegram-bot

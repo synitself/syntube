@@ -12,11 +12,10 @@ from telegram.ext import (
 )
 
 import db
-import settings  # Возвращаем импорт settings для текстов кнопок
+import settings
 from status_manager import update_status_message
 from video_processor import VideoProcessor
 
-# --- Настройка ---
 load_dotenv()
 logging.basicConfig(
     format='%(asctime)s - %(name)s [%(levelname)s] - %(message)s (%(filename)s:%(lineno)d)',
@@ -29,13 +28,11 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 DOWNLOAD_FOLDER = os.getenv('DOWNLOAD_FOLDER', 'downloads')
 MAX_FILE_SIZE_MB = int(os.getenv('MAX_FILE_SIZE_MB', '50'))
 
-# --- Управление состоянием ---
-user_states = {}  # {user_id: {'is_video': Bool, 'by_timestamps': Bool, ...}}
-user_process_locks = {}  # {user_id: asyncio.Lock()}
+user_states = {}
+user_process_locks = {}
 
 
 def get_user_state(user_id: int) -> dict:
-    """Получает или создает состояние для пользователя."""
     if user_id not in user_states:
         user_states[user_id] = {
             'is_video': False,
@@ -48,12 +45,10 @@ def get_user_state(user_id: int) -> dict:
 
 
 async def clear_user_state(user_id: int):
-    """Очищает состояние пользователя."""
     if user_id in user_states:
         del user_states[user_id]
 
 
-# --- Вспомогательные функции ---
 async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     message_id = context.job.data['message_id']
@@ -63,7 +58,6 @@ async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# --- Обработчики ошибок и post_init ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Исключение при обработке обновления:", exc_info=context.error)
     if isinstance(update, Update) and update.effective_user:
@@ -75,13 +69,12 @@ async def post_init(application: Application) -> None:
     logger.info("Bot post_init: Сброс 'зависших' статусов...")
     for user_data in db.get_all_users_with_status_message():
         try:
-            await update_status_message(user_data['user_id'], application.bot, "Ожидание...")
+            await update_status_message(user_data['user_id'], application.bot, "⏱️ Ожидание")
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"Ошибка в post_init для user {user_data['user_id']}: {e}")
 
 
-# --- Основные команды ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_new_user = not db.get_user_settings(user.id)
@@ -91,7 +84,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_new_user:
         db.create_user(user.id)
-        await update_status_message(user.id, context.bot, "Ожидание...")
+        await update_status_message(user.id, context.bot, "⏱️ Ожидание")
 
     sent_msg = await update.effective_chat.send_message(settings.WELCOME_MESSAGE)
     if context.job_queue:
@@ -100,7 +93,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Создает клавиатуру с опциями на основе состояния пользователя."""
     state = get_user_state(user_id)
     video_audio_text = settings.STATUS_VIDEO_MODE if state['is_video'] else settings.STATUS_AUDIO_MODE
     timestamps_text = settings.STATUS_TIMESTAMPS_MODE if state['by_timestamps'] else settings.STATUS_WHOLE_MODE
@@ -113,7 +105,6 @@ def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает ссылку и отправляет меню выбора."""
     user_id = update.effective_user.id
 
     url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
@@ -122,7 +113,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     url = url_match.group(0)
 
-    # Проверяем, не занят ли уже пользователь
     if user_id not in user_process_locks:
         user_process_locks[user_id] = asyncio.Lock()
     if user_process_locks[user_id].locked():
@@ -131,7 +121,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             reply_to_message_id=update.message.message_id
         )
 
-    # Очищаем предыдущее состояние меню, если оно было
     state = get_user_state(user_id)
     if state.get('menu_message_id'):
         try:
@@ -139,12 +128,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except telegram.error.TelegramError:
             pass
 
-    # Инициализируем новое состояние
     state['url'] = url
     state['source_message_id'] = update.message.message_id
 
+    processor = VideoProcessor()
     try:
-        processor = VideoProcessor()
         video_info = await processor.get_video_info(url)
         title = video_info.get('title', 'Неизвестное видео')[:50]
         duration = video_info.get('duration', 0)
@@ -160,10 +148,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error(f"Ошибка при обработке ссылки для user {user_id}: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: Не удалось обработать ссылку.", quote=True)
         await clear_user_state(user_id)
+    finally:
+        await processor.cleanup()
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки меню."""
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
@@ -181,13 +170,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
         await clear_user_state(user_id)
     elif data == "download":
-        # Удаляем меню и запускаем основной процесс
         await query.message.delete()
         asyncio.create_task(start_download_process(user_id, context))
 
 
 async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Основной процесс загрузки, который запускается после нажатия 'скачать'."""
     lock = user_process_locks.get(user_id)
     if not lock or lock.locked():
         return
@@ -218,28 +205,32 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
 
             downloaded_file = await processor.download_media(
                 url, is_video,
-                lambda p: update_status_message(user_id, context.bot, processor.create_progress_bar(int(5 + p * 0.75)))
+                lambda p: update_status_message(user_id, context.bot, processor.create_progress_bar(int(p * 0.5)))
             )
             if not is_video: await processor.download_thumbnail(url)
-            await update_status_message(user_id, context.bot, processor.create_progress_bar(80))
+            await update_status_message(user_id, context.bot, processor.create_progress_bar(50))
 
             segments = []
             if by_timestamps and timestamps:
                 segments = await processor.split_media(
                     downloaded_file, timestamps, is_video,
                     lambda p: update_status_message(user_id, context.bot,
-                                                    processor.create_progress_bar(int(80 + p * 0.18)))
+                                                    processor.create_progress_bar(int(50 + p * 0.3)))
                 )
             else:
-                segments = [downloaded_file]  # Если целиком, то сегмент один - сам файл
-
-            await update_status_message(user_id, context.bot, processor.create_progress_bar(99))
+                segments = [downloaded_file]
+            await update_status_message(user_id, context.bot, processor.create_progress_bar(80))
 
             thumbnail_file = None
             if not is_video and processor.thumbnail_path and processor.thumbnail_path.exists():
                 thumbnail_file = open(processor.thumbnail_path, 'rb')
 
-            for segment_path in segments:
+            total_segments = len(segments)
+            for i, segment_path in enumerate(segments):
+                upload_progress = int(((i + 1) / total_segments) * 100)
+                display_progress = int(80 + upload_progress * 0.2)
+                await update_status_message(user_id, context.bot, processor.create_progress_bar(display_progress))
+
                 with open(segment_path, 'rb') as file_to_send:
                     if thumbnail_file: thumbnail_file.seek(0)
 
@@ -266,11 +257,10 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
         finally:
             await processor.cleanup()
             await clear_user_state(user_id)
-            await update_status_message(user_id, context.bot, "⏱️ Ожидание...")
+            await update_status_message(user_id, context.bot, "⏱️ Ожидание")
             logger.info(f"Обработка для user {user_id} завершена.")
 
 
-# --- Главная функция ---
 def main() -> None:
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN не найден в .env файле!")
