@@ -4,13 +4,13 @@ import asyncio
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
-
+from typing import List, Tuple, Optional, Dict, Any, Callable
 import yt_dlp
 from PIL import Image
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC
 import logging
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,11 @@ class VideoProcessor:
         self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.gettempdir()) / f"video_bot_{unique_id}"
         self.video_info = None
         self.thumbnail_path = None
-
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-
         self.temp_dir.mkdir(exist_ok=True, parents=True)
 
     def create_progress_bar(self, percentage: int, length: int = 10) -> str:
@@ -35,6 +33,26 @@ class VideoProcessor:
         filled_length = int(length * percentage // 100)
         bar = '█' * filled_length + '░' * (length - filled_length)
         return f"[{bar}] {percentage}%"
+
+    def normalize_unicode_text(self, text: str) -> str:
+        try:
+            normalized = unicodedata.normalize('NFC', text)
+            return normalized
+        except Exception as e:
+            logger.warning(f"Ошибка нормализации Unicode: {e}")
+            return text
+
+    def sanitize_metadata_text(self, text: str, max_length: int = 100) -> str:
+        if not text:
+            return "Unknown"
+
+        text = self.normalize_unicode_text(text)
+        text = text.strip()
+
+        if len(text) > max_length:
+            text = text[:max_length - 3] + "..."
+
+        return text if text else "Unknown"
 
     async def get_video_info(self, video_url: str) -> Dict[str, Any]:
         ydl_opts = {'quiet': True, 'no_warnings': True, 'extractflat': 'discard_in_playlist'}
@@ -83,13 +101,30 @@ class VideoProcessor:
         return timestamps
 
     def clean_track_name(self, name: str) -> str:
+        if not name:
+            return 'Unnamed Track'
+
+        name = self.normalize_unicode_text(name)
         cleaned = re.sub(r'[<>:"/\\|?*]', '', name)
         cleaned = re.sub(r'^\d+[.\s]*', '', cleaned)
         cleaned = cleaned.strip()
+
+        if len(cleaned) > 80:
+            cleaned = cleaned[:80] + "..."
+
         return cleaned if cleaned else 'Unnamed Track'
 
     def sanitize_filename(self, filename: str) -> str:
-        return re.sub(r'[<>:"/\\|?*]', '', filename).strip()
+        if not filename:
+            return "unknown_file"
+
+        filename = self.normalize_unicode_text(filename)
+        sanitized = re.sub(r'[<>:"/\\|?*]', '', filename).strip()
+
+        if len(sanitized) > 100:
+            sanitized = sanitized[:100]
+
+        return sanitized if sanitized else "unknown_file"
 
     def _process_thumbnail(self, image_path: Path) -> Path:
         try:
@@ -99,10 +134,8 @@ class VideoProcessor:
                     img = img.convert('RGB')
                 img.thumbnail((320, 320))
                 img.save(processed_path, 'jpeg', quality=85, optimize=True)
-
             if image_path != processed_path and image_path.exists():
                 image_path.unlink()
-
             return processed_path
         except Exception as e:
             logger.error(f"Не удалось обработать обложку {image_path}: {e}")
@@ -118,12 +151,10 @@ class VideoProcessor:
                 file_ext = '.webp'
             elif 'png' in content_type:
                 file_ext = '.png'
-
         video_id = self.video_info.get('id', os.urandom(4).hex())
         original_thumb_path = self.temp_dir / f"thumbnail_{video_id}{file_ext}"
         with open(original_thumb_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
-
         self.thumbnail_path = self._process_thumbnail(original_thumb_path)
         return self.thumbnail_path
 
@@ -138,7 +169,8 @@ class VideoProcessor:
             logger.warning(f"Ошибка загрузки обложки: {e}")
             return None
 
-    async def download_media(self, video_url: str, is_video: bool = True, progress_callback=None) -> Path:
+    async def download_media(self, video_url: str, is_video: bool = True,
+                             progress_callback: Optional[Callable[[float], None]] = None) -> Path:
         def progress_hook(d):
             if d['status'] == 'downloading' and progress_callback:
                 percent_str = d.get('_percent_str', '0%').strip().replace('%', '')
@@ -176,36 +208,52 @@ class VideoProcessor:
 
         raise FileNotFoundError(f"Загруженный файл не найден: {expected_file}")
 
-    def _blocking_add_metadata(self, file_path: Path, title: str, artist: str, album: str):
+    def _blocking_add_metadata(self, file_path: Path, title: str, artist: str):
         try:
-            audio = MP3(str(file_path), ID3=ID3)
-            if audio.tags is None: audio.add_tags()
-            audio.tags.delall('TIT2');
+            title = self.sanitize_metadata_text(title, 100)
+            artist = self.sanitize_metadata_text(artist, 100)
+
+            logger.info(f"Добавление метаданных в {file_path.name}: title='{title}', artist='{artist}'")
+
+            audio = MP3(str(file_path))
+
+            if audio.tags is None:
+                audio.add_tags()
+                logger.info(f"Добавлены новые теги для {file_path.name}")
+
+            audio.tags.delall('TIT2')
             audio.tags.add(TIT2(encoding=3, text=title))
-            audio.tags.delall('TPE1');
+
+            audio.tags.delall('TPE1')
             audio.tags.add(TPE1(encoding=3, text=artist))
-            audio.tags.delall('TALB');
-            audio.tags.add(TALB(encoding=3, text=album))
+
             audio.tags.delall('APIC')
             if self.thumbnail_path and self.thumbnail_path.exists():
-                with open(self.thumbnail_path, 'rb') as art:
-                    mime = 'image/jpeg'
-                    audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc='Cover', data=art.read()))
-            audio.save()
-        except Exception as e:
-            logger.warning(f"Ошибка добавления метаданных в {file_path.name}: {e}")
+                try:
+                    with open(self.thumbnail_path, 'rb') as art:
+                        audio.tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=art.read()))
+                except Exception as thumb_e:
+                    logger.warning(f"Ошибка добавления обложки в {file_path.name}: {thumb_e}")
 
-    async def add_metadata_to_audio(self, file_path: Path, title: str, artist: str, album: str):
-        await self.loop.run_in_executor(None, self._blocking_add_metadata, file_path, title, artist, album)
+            audio.save(v2_version=3)
+            logger.info(f"Метаданные успешно сохранены для {file_path.name}")
+
+        except Exception as e:
+            logger.error(f"КРИТИЧЕСКАЯ ОШИБКА при добавлении метаданных в {file_path.name}: {e}", exc_info=True)
+            raise
+
+    async def add_metadata_to_audio(self, file_path: Path, title: str, artist: str):
+        await self.loop.run_in_executor(None, self._blocking_add_metadata, file_path, title, artist)
 
     async def split_media_ffmpeg(self, file_path: Path, timestamps: List[Tuple[int, str]], is_video: bool,
-                                 progress_callback=None) -> List[Path]:
+                                 progress_callback: Optional[Callable[[int], None]] = None) -> List[Path]:
         segments = []
         total_duration = self.video_info.get('duration')
         file_extension = file_path.suffix
 
         for i, (start_time, title) in enumerate(timestamps):
             end_time = timestamps[i + 1][0] if i + 1 < len(timestamps) else total_duration
+
             if end_time is None:
                 logger.warning(f"Не удалось определить время окончания для последнего сегмента '{title}', пропускаем.")
                 continue
@@ -231,26 +279,27 @@ class VideoProcessor:
             else:
                 logger.error(f"Ошибка FFMPEG при создании сегмента '{segment_path.name}'.")
 
-        if not is_video:
-            video_title_as_artist_and_album = self.video_info.get('title', 'Unknown Album')
-            for i, segment_path in enumerate(segments):
-                track_title = self.sanitize_filename(timestamps[i][1])
-                await self.add_metadata_to_audio(
-                    file_path=segment_path,
-                    title=track_title,
-                    artist=video_title_as_artist_and_album,
-                    album=video_title_as_artist_and_album
-                )
-                if progress_callback:
-                    await progress_callback(int((i + 1) / len(segments) * 100))
+            if progress_callback:
+                progress_percent = int((i + 1) / len(timestamps) * 100)
+                await progress_callback(progress_percent)
 
-        elif progress_callback:
-            await progress_callback(100)
+        if not is_video:
+            video_title = self.video_info.get('title', 'Unknown Album')
+            for i, segment_path in enumerate(segments):
+                try:
+                    track_title = timestamps[i][1] if i < len(timestamps) else f"Track {i + 1}"
+                    await self.add_metadata_to_audio(
+                        file_path=segment_path,
+                        title=track_title,
+                        artist=video_title
+                    )
+                except Exception as metadata_e:
+                    logger.error(f"Ошибка добавления метаданных для сегмента {segment_path.name}: {metadata_e}")
 
         return segments
 
     async def split_media(self, file_path: Path, timestamps: List[Tuple[int, str]], is_video: bool = True,
-                          progress_callback=None) -> List[Path]:
+                          progress_callback: Optional[Callable[[int], None]] = None) -> List[Path]:
         return await self.split_media_ffmpeg(file_path, timestamps, is_video, progress_callback)
 
     def _blocking_cleanup(self):

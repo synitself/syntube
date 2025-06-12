@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import re
-
 import telegram.error
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -10,13 +9,13 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, CallbackQueryHandler
 )
-
 import db
 import settings
 from status_manager import update_status_message
 from video_processor import VideoProcessor
 
 load_dotenv()
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s [%(levelname)s] - %(message)s (%(filename)s:%(lineno)d)',
     level=logging.INFO
@@ -49,6 +48,23 @@ async def clear_user_state(user_id: int):
         del user_states[user_id]
 
 
+def get_audio_metadata(file_path):
+    try:
+        from mutagen.mp3 import MP3
+        from mutagen.id3 import ID3NoHeaderError
+
+        audio = MP3(str(file_path))
+        if audio.tags:
+            title = str(audio.tags.get('TIT2', ['Unknown'])[0]) if audio.tags.get('TIT2') else 'Unknown'
+            artist = str(audio.tags.get('TPE1', ['Unknown'])[0]) if audio.tags.get('TPE1') else 'Unknown'
+            duration = int(audio.info.length) if audio.info.length else 0
+            return title, artist, duration
+    except Exception as e:
+        logger.warning(f"Ошибка чтения метаданных из {file_path}: {e}")
+
+    return 'Unknown', 'Unknown', 0
+
+
 async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     message_id = context.job.data['message_id']
@@ -78,14 +94,11 @@ async def post_init(application: Application) -> None:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_new_user = not db.get_user_settings(user.id)
-
     if update.message:
         await update.message.delete()
-
     if is_new_user:
         db.create_user(user.id)
         await update_status_message(user.id, context.bot, "⏱️ Ожидание")
-
     sent_msg = await update.effective_chat.send_message(settings.WELCOME_MESSAGE)
     if context.job_queue:
         context.job_queue.run_once(delete_message_after_delay, 15, chat_id=update.effective_chat.id,
@@ -106,11 +119,9 @@ def create_options_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-
     url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     url_match = re.search(url_pattern, update.message.text)
     if not url_match: return
-
     url = url_match.group(0)
 
     if user_id not in user_process_locks:
@@ -137,13 +148,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         title = video_info.get('title', 'Неизвестное видео')[:50]
         duration = video_info.get('duration', 0)
         duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "неизвестно"
-
         message_text = f"🎬 **{title}**\n⏱️ Длительность: {duration_str}\n\nВыберите параметры загрузки:"
         keyboard = create_options_keyboard(user_id)
-
         sent_menu = await update.message.reply_text(message_text, reply_markup=keyboard, parse_mode='Markdown')
         state['menu_message_id'] = sent_menu.message_id
-
     except Exception as e:
         logger.error(f"Ошибка при обработке ссылки для user {user_id}: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: Не удалось обработать ссылку.", quote=True)
@@ -182,14 +190,12 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
     async with lock:
         state = get_user_state(user_id)
         processor = VideoProcessor()
-
         url = state['url']
         is_video = state['is_video']
         by_timestamps = state['by_timestamps']
         source_message_id = state['source_message_id']
 
         try:
-            # 1. Более осмысленное начальное сообщение
             await update_status_message(user_id, context.bot, "🔍 Анализ ссылки...")
             video_info = await processor.get_video_info(url)
             if not video_info: raise ValueError("Не удалось получить информацию о видео.")
@@ -203,16 +209,12 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
                     await asyncio.sleep(3)
                     by_timestamps = False
 
-            # 2. Установка статуса 0% перед началом скачивания
             await update_status_message(user_id, context.bot, processor.create_progress_bar(0))
+            downloaded_file = await processor.download_media(url, is_video, progress_callback=None)
 
-            # 3. Скачивание без промежуточных обновлений прогресса
-            downloaded_file = await processor.download_media(
-                url, is_video, progress_callback=None
-            )
-            if not is_video: await processor.download_thumbnail(url)
+            if not is_video:
+                await processor.download_thumbnail(url)
 
-            # 4. Установка статуса 50% после завершения скачивания
             await update_status_message(user_id, context.bot, processor.create_progress_bar(50))
 
             segments = []
@@ -224,6 +226,7 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
                 )
             else:
                 segments = [downloaded_file]
+
             await update_status_message(user_id, context.bot, processor.create_progress_bar(80))
 
             thumbnail_file = None
@@ -236,24 +239,38 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
                 display_progress = int(80 + upload_progress * 0.2)
                 await update_status_message(user_id, context.bot, processor.create_progress_bar(display_progress))
 
+                file_size_mb = segment_path.stat().st_size / (1024 * 1024)
+                logger.info(f"Отправка файла {segment_path.name} размером {file_size_mb:.1f} МБ")
+
                 with open(segment_path, 'rb') as file_to_send:
-                    if thumbnail_file: thumbnail_file.seek(0)
+                    if thumbnail_file:
+                        thumbnail_file.seek(0)
 
                     if is_video:
                         await context.bot.send_video(
-                            chat_id=user_id, video=file_to_send,
+                            chat_id=user_id,
+                            video=file_to_send,
                             caption=f"🎬 {segment_path.stem}",
                             reply_to_message_id=source_message_id
                         )
                     else:
+                        title, artist, duration = get_audio_metadata(segment_path)
+                        logger.info(
+                            f"Метаданные для {segment_path.name}: title='{title}', artist='{artist}', duration={duration}")
+
                         await context.bot.send_audio(
-                            chat_id=user_id, audio=file_to_send,
+                            chat_id=user_id,
+                            audio=file_to_send,
+                            title=title,
+                            performer=artist,
+                            duration=duration,
                             thumbnail=thumbnail_file,
                             reply_to_message_id=source_message_id
                         )
                 await asyncio.sleep(1)
 
-            if thumbnail_file: thumbnail_file.close()
+            if thumbnail_file:
+                thumbnail_file.close()
 
         except Exception as e:
             logger.error(f"Ошибка в start_download_process для user {user_id}: {e}", exc_info=True)
@@ -270,16 +287,12 @@ def main() -> None:
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN не найден в .env файле!")
         return
-
     db.initialize_db()
-
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     application.add_handler(CallbackQueryHandler(button_callback))
-
     logger.info("Бот запускается...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
