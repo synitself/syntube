@@ -189,8 +189,8 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
         source_message_id = state['source_message_id']
 
         try:
-            await update_status_message(user_id, context.bot, processor.create_progress_bar(1))
-
+            # 1. Более осмысленное начальное сообщение
+            await update_status_message(user_id, context.bot, "🔍 Анализ ссылки...")
             video_info = await processor.get_video_info(url)
             if not video_info: raise ValueError("Не удалось получить информацию о видео.")
 
@@ -203,11 +203,16 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
                     await asyncio.sleep(3)
                     by_timestamps = False
 
+            # 2. Установка статуса 0% перед началом скачивания
+            await update_status_message(user_id, context.bot, processor.create_progress_bar(0))
+
+            # 3. Скачивание без промежуточных обновлений прогресса
             downloaded_file = await processor.download_media(
-                url, is_video,
-                lambda p: update_status_message(user_id, context.bot, processor.create_progress_bar(int(p * 0.5)))
+                url, is_video, progress_callback=None
             )
             if not is_video: await processor.download_thumbnail(url)
+
+            # 4. Установка статуса 50% после завершения скачивания
             await update_status_message(user_id, context.bot, processor.create_progress_bar(50))
 
             segments = []
