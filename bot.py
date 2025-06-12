@@ -232,6 +232,14 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
                 )
             else:
                 segments = [downloaded_file]
+                if not is_video:
+                    video_title = video_info.get('title', 'Unknown Video')
+                    await processor.add_metadata_to_audio(
+                        file_path=downloaded_file,
+                        title="Full",
+                        artist=video_title
+                    )
+                    logger.info(f"Добавлены метаданные для полного трека: title='Full', artist='{video_title}'")
 
             await update_status_message(user_id, context.bot, processor.create_progress_bar(80))
 
