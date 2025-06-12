@@ -198,16 +198,22 @@ async def start_download_process(user_id: int, context: ContextTypes.DEFAULT_TYP
         try:
             await update_status_message(user_id, context.bot, "🔍 Анализ ссылки...")
             video_info = await processor.get_video_info(url)
-            if not video_info: raise ValueError("Не удалось получить информацию о видео.")
+            if not video_info:
+                raise ValueError("Не удалось получить информацию о видео.")
 
             timestamps = []
             if by_timestamps:
-                timestamps = processor.get_chapters_from_video_info() or processor.parse_timestamps(
-                    video_info.get('description', ''))
+                await update_status_message(user_id, context.bot, "📝 Поиск таймкодов...")
+
+                await processor.get_video_comments(url)
+                timestamps = processor.get_all_timestamps(url)
+
                 if not timestamps:
                     await update_status_message(user_id, context.bot, "ℹ️ Таймкоды не найдены, загружаю целиком.")
                     await asyncio.sleep(3)
                     by_timestamps = False
+                else:
+                    logger.info(f"Найдено {len(timestamps)} временных меток")
 
             await update_status_message(user_id, context.bot, processor.create_progress_bar(0))
             downloaded_file = await processor.download_media(url, is_video, progress_callback=None)

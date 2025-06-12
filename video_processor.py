@@ -21,6 +21,7 @@ class VideoProcessor:
         self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.gettempdir()) / f"video_bot_{unique_id}"
         self.video_info = None
         self.thumbnail_path = None
+        self.comments = None
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -64,40 +65,125 @@ class VideoProcessor:
         except Exception as e:
             raise Exception(f"Ошибка получения информации о видео: {str(e)}") from e
 
-    def parse_timestamps(self, description: str) -> List[Tuple[int, str]]:
+    async def get_video_comments(self, video_url: str, max_comments: int = 50) -> List[Dict]:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'writecomments': True,
+            'getcomments': True,
+            'max_comments': max_comments,
+            'skip_download': True
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await self.loop.run_in_executor(None, lambda: ydl.extract_info(video_url, download=False))
+                self.comments = info.get('comments', []) or []
+                logger.info(f"Получено {len(self.comments)} комментариев")
+                return self.comments
+        except Exception as e:
+            logger.warning(f"Ошибка получения комментариев: {e}")
+            return []
+
+    def find_pinned_comment_timestamps(self) -> List[Tuple[int, str]]:
+        if not self.comments:
+            return []
+
+        pinned_comment = None
+        for comment in self.comments:
+            if comment.get('is_pinned', False):
+                pinned_comment = comment
+                break
+
+        if not pinned_comment:
+            logger.info("Закреплённый комментарий не найден")
+            return []
+
+        comment_text = pinned_comment.get('text', '')
+        logger.info(f"Найден закреплённый комментарий: {comment_text[:100]}...")
+
+        return self.parse_timestamps(comment_text)
+
+    def parse_timestamps(self, text: str) -> List[Tuple[int, str]]:
+        if not text:
+            return []
+
         timestamps = []
+
         patterns = [
-            r'(?:^|\n)\s*((?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d))\s+(.+?)(?=\n|$)',
+            r'(?:^|\n)\s*((?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d))\s+(.+?)(?=\n|(?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d)|$)',
             r'(?:^|\n)\s*\[((?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d))\]\s+(.+?)(?=\n|$)',
             r'(?:^|\n)\s*((?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d))\s*[-—–]\s*(.+?)(?=\n|$)',
+            r'((?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d))\s+([^0-9\n]+?)(?=(?:\d{1,2}:)?(?:[0-5]?\d):(?:[0-5]\d)|$)',
         ]
+
         for pattern in patterns:
-            matches = re.findall(pattern, description, re.MULTILINE | re.IGNORECASE)
+            matches = re.findall(pattern, text, re.MULTILINE | re.IGNORECASE | re.DOTALL)
             if matches:
+                logger.info(f"Найдено {len(matches)} временных меток с шаблоном: {pattern[:30]}...")
                 for time_str, title in matches:
-                    parts = list(map(int, time_str.split(':')))
-                    seconds = 0
-                    if len(parts) == 3:
-                        seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
-                    elif len(parts) == 2:
-                        seconds = parts[0] * 60 + parts[1]
-                    else:
-                        seconds = parts[0]
-                    clean_title = self.clean_track_name(title.strip())
-                    if clean_title: timestamps.append((seconds, clean_title))
+                    seconds = self.parse_time_to_seconds(time_str)
+                    if seconds is not None:
+                        clean_title = self.clean_track_name(title.strip())
+                        if clean_title:
+                            timestamps.append((seconds, clean_title))
+                            logger.debug(f"Добавлена временная метка: {time_str} -> {seconds}s: {clean_title}")
                 break
+
         timestamps.sort(key=lambda x: x[0])
+        logger.info(f"Итого обработано временных меток: {len(timestamps)}")
         return timestamps
 
+    def parse_time_to_seconds(self, time_str: str) -> Optional[int]:
+        try:
+            parts = list(map(int, time_str.split(':')))
+            seconds = 0
+            if len(parts) == 3:
+                seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2:
+                seconds = parts[0] * 60 + parts[1]
+            else:
+                seconds = parts[0]
+            return seconds
+        except (ValueError, IndexError):
+            return None
+
     def get_chapters_from_video_info(self) -> List[Tuple[int, str]]:
-        if not self.video_info: return []
-        chapters = self.video_info.get('chapters', [])
+        if not self.video_info:
+            return []
+
+        chapters = self.video_info.get('chapters')
+        if chapters is None or not chapters:
+            return []
+
         timestamps = []
         for chapter in chapters:
             start_time = chapter.get('start_time', 0)
             title = chapter.get('title', f'Часть {len(timestamps) + 1}')
             clean_title = self.clean_track_name(title)
             timestamps.append((int(start_time), clean_title))
+
+        return timestamps
+
+    def get_all_timestamps(self, video_url: str) -> List[Tuple[int, str]]:
+        timestamps = []
+
+        timestamps = self.get_chapters_from_video_info()
+        if timestamps:
+            logger.info(f"Найдены главы видео: {len(timestamps)} меток")
+            return timestamps
+
+        if self.comments:
+            timestamps = self.find_pinned_comment_timestamps()
+            if timestamps:
+                logger.info(f"Найдены таймкоды в закреплённом комментарии: {len(timestamps)} меток")
+                return timestamps
+
+        description = self.video_info.get('description', '') if self.video_info else ''
+        timestamps = self.parse_timestamps(description)
+        if timestamps:
+            logger.info(f"Найдены таймкоды в описании: {len(timestamps)} меток")
+
         return timestamps
 
     def clean_track_name(self, name: str) -> str:
